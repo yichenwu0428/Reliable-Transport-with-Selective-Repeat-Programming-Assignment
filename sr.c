@@ -1,11 +1,12 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h> // Added for memcpy
 #include "emulator.h"
-#include "gbn.h"
+#include "sr.h" // Changed from gbn.h
 
 /* ******************************************************************
-   Go Back N protocol.  Adapted from J.F.Kurose
+   Selective Repeat protocol.  Adapted from J.F.Kurose
    ALTERNATING BIT AND GO-BACK-N NETWORK EMULATOR: VERSION 1.2
 
    Network properties:
@@ -19,7 +20,8 @@
    Modifications:
    - removed bidirectional GBN code and other code not used by prac.
    - fixed C style to adhere to current programming style
-   - added GBN implementation
+   - added GBN implementation (Base for SR)
+   - Implemented Selective Repeat receiver logic (Step 1)
 **********************************************************************/
 
 #define RTT  16.0       /* round trip time.  MUST BE SET TO 16.0 when submitting assignment */
@@ -56,6 +58,7 @@ bool IsCorrupted(struct pkt packet)
 
 
 /********* Sender (A) variables and functions ************/
+// ... (A side code remains the same as gbn.c for now) ...
 
 static struct pkt buffer[WINDOWSIZE];  /* array for storing packets waiting for ACK */
 static int windowfirst, windowlast;    /* array indexes of the first/last packet awaiting ACK */
@@ -178,7 +181,7 @@ void A_timerinterrupt(void)
 
     tolayer3(A,buffer[(windowfirst+i) % WINDOWSIZE]);
     packets_resent++;
-    if (i==0) starttimer(A,RTT);
+    if (i==0) starttimer(A,RTT); // GBN retransmits and restarts timer for the first packet
   }
 }
 
@@ -203,53 +206,123 @@ void A_init(void)
 /********* Receiver (B)  variables and procedures ************/
 
 static int expectedseqnum; /* the sequence number expected next by the receiver */
-static int B_nextseqnum;   /* the sequence number for the next packets sent by B */
+static int B_nextseqnum;   /* the sequence number for the next packets sent by B (used for ACK seqnum) */
 
+// SR Receiver specific variables
+static struct pkt rcv_buffer[WINDOWSIZE]; // Buffer for storing received packets
+static bool buffered[SEQSPACE];           // To track which sequence numbers are buffered
 
 /* called from layer 3, when a packet arrives for layer 4 at B*/
 void B_input(struct pkt packet)
 {
   struct pkt sendpkt;
   int i;
+  int packet_seqnum = packet.seqnum;
 
-  /* if not corrupted and received packet is in order */
-  if  ( (!IsCorrupted(packet))  && (packet.seqnum == expectedseqnum) ) {
+  /* if not corrupted */
+  if (!IsCorrupted(packet)) {
     if (TRACE > 0)
-      printf("----B: packet %d is correctly received, send ACK!\n",packet.seqnum);
+      printf("----B: uncorrupted packet %d received\n", packet_seqnum);
     packets_received++;
 
-    /* deliver to receiving application */
-    tolayer5(B, packet.payload);
+    // Check if the received packet is within the receiver's window [expectedseqnum, expectedseqnum + WINDOWSIZE - 1] (modulo SEQSPACE)
+    bool in_window = false;
+    int end_window = (expectedseqnum + WINDOWSIZE - 1) % SEQSPACE;
 
-    /* send an ACK for the received packet */
-    sendpkt.acknum = expectedseqnum;
+    if (expectedseqnum <= end_window) { // Window does not wrap around sequence space
+        if (packet_seqnum >= expectedseqnum && packet_seqnum <= end_window) {
+            in_window = true;
+        }
+    } else { // Window wraps around sequence space
+        if (packet_seqnum >= expectedseqnum || packet_seqnum <= end_window) {
+            in_window = true;
+        }
+    }
 
-    /* update state variables */
-    expectedseqnum = (expectedseqnum + 1) % SEQSPACE;
+
+    if (in_window) {
+        if (TRACE > 0)
+            printf("----B: packet %d is within the receiver window\n", packet_seqnum);
+
+        // Send individual ACK for the received packet
+        sendpkt.seqnum = B_nextseqnum; // You can still use a simple sequence number for ACKs if not implementing bidirectional
+        sendpkt.acknum = packet_seqnum;
+        // we don't have any data to send back.  fill payload with 0's
+        for ( i=0; i<20 ; i++ )
+            sendpkt.payload[i] = '0';
+        sendpkt.checksum = ComputeChecksum(sendpkt);
+        tolayer3(B, sendpkt);
+        if (TRACE > 0)
+            printf("----B: sending ACK for packet %d\n", packet_seqnum);
+
+
+        // Calculate buffer index
+        int buffer_index = (packet_seqnum - expectedseqnum + SEQSPACE) % SEQSPACE;
+
+        // Buffer the packet if it's a new packet within the window
+        if (!buffered[buffer_index]) {
+            rcv_buffer[buffer_index] = packet; // Copy the packet
+            buffered[buffer_index] = true;
+            if (TRACE > 0)
+                 printf("----B: buffering packet %d at index %d\n", packet_seqnum, buffer_index);
+        } else {
+             if (TRACE > 0)
+                 printf("----B: packet %d is a duplicate within the window, already buffered\n", packet_seqnum);
+        }
+
+
+        // Check if packets can be delivered to Layer 5
+        while (buffered[0]) { // While the packet at the start of the window is buffered
+            if (TRACE > 0)
+                printf("----B: delivering packet %d to layer 5\n", expectedseqnum);
+            tolayer5(B, rcv_buffer[0].payload);
+
+            // Slide the receiver window
+            expectedseqnum = (expectedseqnum + 1) % SEQSPACE;
+
+            // Shift buffered packets and flags
+            for (i = 0; i < WINDOWSIZE - 1; i++) {
+                rcv_buffer[i] = rcv_buffer[i+1];
+                buffered[i] = buffered[i+1];
+            }
+            // Mark the last position as not buffered
+            buffered[WINDOWSIZE - 1] = false;
+
+             if (TRACE > 0)
+                 printf("----B: receiver window slides to expected seq %d\n", expectedseqnum);
+        }
+
+    } else {
+      if (TRACE > 0)
+        printf("----B: packet %d is outside the receiver window [%d, %d], discarding\n", packet_seqnum, expectedseqnum, end_window);
+      // If packet is outside the window, it's either a packet that has already been ACKed and delivered,
+      // or a packet far ahead that we are not ready for. In SR, we typically just discard.
+      // However, sending an ACK for a duplicate (already delivered) packet is also a valid strategy
+      // to help the sender. Let's add sending ACK for already delivered packets if not corrupted.
+       if (packet_seqnum < expectedseqnum) { // This packet has likely already been delivered
+           if (TRACE > 0)
+              printf("----B: packet %d is a duplicate (already delivered), resending ACK\n", packet_seqnum);
+           sendpkt.seqnum = B_nextseqnum;
+           sendpkt.acknum = packet_seqnum;
+           for ( i=0; i<20 ; i++ )
+              sendpkt.payload[i] = '0';
+           sendpkt.checksum = ComputeChecksum(sendpkt);
+           tolayer3(B, sendpkt);
+            if (TRACE > 0)
+                printf("----B: resending ACK for packet %d\n", packet_seqnum);
+       }
+    }
   }
   else {
-    /* packet is corrupted or out of order resend last ACK */
     if (TRACE > 0)
-      printf("----B: packet corrupted or not expected sequence number, resend ACK!\n");
-    if (expectedseqnum == 0)
-      sendpkt.acknum = SEQSPACE - 1;
-    else
-      sendpkt.acknum = expectedseqnum - 1;
+      printf ("----B: corrupted packet received, discarding\n");
+    // In SR, if a packet is corrupted, the receiver discards it.
+    // The sender's timer for that packet will eventually time out, triggering retransmission.
+    // No ACK is sent for corrupted packets.
   }
 
-  /* create packet */
-  sendpkt.seqnum = B_nextseqnum;
+  // This simple ACK sequence number increment is fine for unidirectional data transfer from A to B
   B_nextseqnum = (B_nextseqnum + 1) % 2;
-
-  /* we don't have any data to send.  fill payload with 0's */
-  for ( i=0; i<20 ; i++ )
-    sendpkt.payload[i] = '0';
-
-  /* computer checksum */
-  sendpkt.checksum = ComputeChecksum(sendpkt);
-
-  /* send out packet */
-  tolayer3 (B, sendpkt);
 }
 
 /* the following routine will be called once (only) before any other */
@@ -257,7 +330,14 @@ void B_input(struct pkt packet)
 void B_init(void)
 {
   expectedseqnum = 0;
-  B_nextseqnum = 1;
+  B_nextseqnum = 1; // Initial sequence number for ACKs from B (can be anything, just needs to change for checksum)
+
+  // Initialize SR receiver buffer and flags
+  for (int i = 0; i < WINDOWSIZE; i++) {
+      buffered[i] = false;
+  }
+   if (TRACE > 0)
+       printf("----B: Initialized receiver buffer and flags.\n");
 }
 
 /******************************************************************************
