@@ -183,7 +183,7 @@ void init(void)                         /* initialize the simulator */
   printf("-----  Stop and Wait Network Simulator Version 1.1 -------- \n\n");
   printf("Enter the number of messages to simulate: ");
   scanf("%d",&nsimmax);
-  printf("Enter  packet loss probability [enter 0.0 for no loss]:");
+  printf("Enter packet loss probability [enter 0.0 for no loss]:");
   scanf("%f",&lossprob);
   printf("Enter packet corruption probability [0.0 for no corruption]:");
   scanf("%f",&corruptprob);
